@@ -1068,6 +1068,7 @@ ieee80211_enqueue_data(struct ieee80211com *ic, mbuf_t m,
     struct _ifnet *ifp = &ic->ic_if;
     struct ether_header *eh;
     mbuf_t m1;
+    mbuf_t m2;
     
     eh = mtod(m, struct ether_header *);
     
@@ -1128,9 +1129,17 @@ ieee80211_enqueue_data(struct ieee80211com *ic, mbuf_t m,
             if (ifp->if_bpf && m1 == NULL)
                 bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_IN);
 #endif
-#if (defined AIRPORT) && (defined USE_APPLE_SUPPLICANT)
+#ifdef USE_APPLE_SUPPLICANT
             ml_enqueue(ml, m);
 #else
+#ifdef IO80211FAMILY_V2
+            if (ieee80211_is_8021x_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
+                XYLog("%s Duplicate EAPOL packet to user space\n", __FUNCTION__);
+                mbuf_dup(m, MBUF_DONTWAIT, &m2);
+                if (m2 != NULL)
+                    ifp->iface->inputPacket(m2, mbuf_len(m2));
+            }
+#endif
             ieee80211_eapol_key_input(ic, m, ni);
 #endif
         } else {
@@ -1600,8 +1609,8 @@ ieee80211_save_ie(const u_int8_t *frm, u_int8_t **ie)
     
     if (*ie == NULL || olen != len) {
         if (*ie != NULL)
-            IOFree(*ie, olen);
-        *ie = (u_int8_t *)_MallocZero(len);
+            free(*ie);
+        *ie = (u_int8_t *)malloc(len, 0, 0);
         if (*ie == NULL)
             return ENOMEM;
     }
@@ -2871,9 +2880,11 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
         case IEEE80211_M_STA: {
             int bgscan = ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
                           ic->ic_state == IEEE80211_S_RUN);
+            int roamscan = bgscan &&
+                        (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
             int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
                              ic->ic_state >= IEEE80211_S_AUTH);
-            if (!(bgscan || stay_auth))
+            if (!(roamscan || stay_auth))
                 ieee80211_new_state(ic, IEEE80211_S_AUTH,
                                     IEEE80211_FC0_SUBTYPE_DEAUTH);
         }
@@ -2931,7 +2942,9 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
         case IEEE80211_M_STA: {
             int bgscan = ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
                           ic->ic_state == IEEE80211_S_RUN);
-            if (!bgscan) /* ignore disassoc during bgscan */
+            int roamscan = bgscan &&
+                        (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
+            if (!roamscan) /* ignore disassoc during bgscan */
                 ieee80211_new_state(ic, IEEE80211_S_ASSOC,
                                     IEEE80211_FC0_SUBTYPE_DISASSOC);
         }
@@ -2974,6 +2987,11 @@ ieee80211_recv_addba_req(struct ieee80211com *ic, mbuf_t m,
     u_int8_t token, tid;
     int err = 0;
     
+    /* Ignore if we are not ready to receive data frames. */
+    if (ic->ic_state != IEEE80211_S_RUN ||
+        ((ic->ic_flags & IEEE80211_F_RSNON) && !ni->ni_port_valid))
+        return;
+    
     if (!(ni->ni_flags & IEEE80211_NODE_HT)) {
         DPRINTF(("received ADDBA req from non-HT STA %s\n",
                  ether_sprintf(ni->ni_macaddr)));
@@ -3003,6 +3021,7 @@ ieee80211_recv_addba_req(struct ieee80211com *ic, mbuf_t m,
         return;
     /* If we are in the process of roaming between APs, ignore. */
     if ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
+        ((ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0) &&
         (ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY))
         return;
     /* check if we already have a Block Ack agreement for this RA/TID */
@@ -3063,7 +3082,7 @@ ieee80211_recv_addba_req(struct ieee80211com *ic, mbuf_t m,
     ba->ba_winstart = ssn;
     ba->ba_winend = (ba->ba_winstart + ba->ba_winsize - 1) & 0xfff;
     /* allocate and setup our reordering buffer */
-    ba->ba_buf = (struct ieee80211_ba_buf*)_MallocZero(IEEE80211_BA_MAX_WINSZ * sizeof(struct ieee80211_ba_buf));
+    ba->ba_buf = (struct ieee80211_ba_buf*)malloc(IEEE80211_BA_MAX_WINSZ * sizeof(struct ieee80211_ba_buf), 0, 0);
     if (ba->ba_buf == NULL)
         goto refuse;
     
@@ -3113,8 +3132,7 @@ ieee80211_addba_req_refuse(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
     struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
     
-    IOFree(ba->ba_buf,
-           IEEE80211_BA_MAX_WINSZ * sizeof(*ba->ba_buf));
+    free(ba->ba_buf);
     ba->ba_buf = NULL;
     ba->ba_state = IEEE80211_BA_INIT;
     
@@ -3294,8 +3312,7 @@ ieee80211_recv_delba(struct ieee80211com *ic, mbuf_t m,
             for (i = 0; i < IEEE80211_BA_MAX_WINSZ; i++)
                 mbuf_freem(ba->ba_buf[i].m);
             /* free reordering buffer */
-            IOFree(ba->ba_buf,
-                   IEEE80211_BA_MAX_WINSZ * sizeof(*ba->ba_buf));
+            free(ba->ba_buf);
             ba->ba_buf = NULL;
         }
     } else {
